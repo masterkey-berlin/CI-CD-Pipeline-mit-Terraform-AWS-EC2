@@ -1,0 +1,166 @@
+name: Deploy React App to AWS EC2
+
+on:
+  push:
+    branches:
+      - main # Oder dein Haupt-Entwicklungsbranch
+  workflow_dispatch: # Ermöglicht manuelles Auslösen
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }} # Wird global für Jobs gesetzt
+  TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+  TF_STATE_DYNAMODB_TABLE: ${{ secrets.TF_STATE_DYNAMODB_TABLE }}
+  # Terraform benötigt diese ENV Vars für das S3 Backend, wenn sie nicht in der backend-config Datei stehen
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  # AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }} # Falls du temporäre Credentials/Rollen nutzt
+
+jobs:
+  ci_build:
+    name: Build React App
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.artifact_info.outputs.artifact_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18' # Oder deine bevorzugte LTS Version
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build React app
+        working-directory: ./frontend
+        run: npm run build
+
+      - name: Define artifact name
+        id: artifact_info
+        run: echo "artifact_name=frontend-build-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact_info.outputs.artifact_name }}
+          path: frontend/dist/
+          retention-days: 7
+
+  infra_provision:
+    name: Provision AWS Infrastructure with Terraform
+    runs-on: ubuntu-latest
+    needs: ci_build # Läuft erst nach erfolgreichem Build
+    outputs:
+      ec2_public_ip: ${{ steps.tf_outputs.outputs.instance_public_ip }}
+      ec2_user: ${{ steps.tf_vars.outputs.ec2_user_var }}
+    env: # Umgebungsvariablen spezifisch für diesen Job
+      # AWS Credentials werden von der Action aws-actions/configure-aws-credentials gesetzt
+      TF_VAR_ssh_public_key_content: ${{ secrets.SSH_PUBLIC_KEY }} # Übergibt den Inhalt des Public Keys an Terraform
+      TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+      # Weitere TF_VARs hier, falls benötigt
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          # aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }} # Falls verwendet
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        # with:
+        #   terraform_version: "1.x.x" # Spezifische Version, falls nötig
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=react-app/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.TF_STATE_DYNAMODB_TABLE }}" \
+            -reconfigure
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ./terraform
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./terraform
+        run: terraform plan -no-color -input=false -var="ec2_user=${{ secrets.EC2_USER }}" # Übergabe der EC2_USER Variable
+        continue-on-error: false # Pipeline soll bei Plan-Fehlern stoppen (optional)
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: ./terraform
+        run: terraform apply -auto-approve -input=false -var="ec2_user=${{ secrets.EC2_USER }}"
+
+      - name: Get Terraform Outputs
+        id: tf_outputs
+        working-directory: ./terraform
+        run: |
+          echo "instance_public_ip=$(terraform output -raw instance_public_ip)" >> $GITHUB_OUTPUT
+      
+      - name: Set EC2 User Variable from Secret
+        id: tf_vars
+        run: echo "ec2_user_var=${{ secrets.EC2_USER }}" >> $GITHUB_OUTPUT
+
+
+  app_deploy:
+    name: Deploy App to EC2
+    runs-on: ubuntu-latest
+    needs: infra_provision # Läuft erst nach erfolgreicher Infrastruktur-Provisionierung
+    env:
+      EC2_HOST: ${{ needs.infra_provision.outputs.ec2_public_ip }}
+      EC2_USER: ${{ needs.infra_provision.outputs.ec2_user }} # Verwende den Output vom infra_provision Job
+      ARTIFACT_NAME: ${{ needs.ci_build.outputs.artifact_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4 # Nicht unbedingt nötig, wenn nur Artefakt gebraucht wird
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ./dist_downloaded # Lädt den Inhalt von frontend/dist/ hierhin
+
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Create target directory on EC2 and set permissions
+        run: |
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ${{ env.EC2_USER }}@${{ env.EC2_HOST }} \
+            'sudo mkdir -p /var/www/html/app && sudo chown -R ${{ env.EC2_USER }}:${{ env.EC2_USER }} /var/www/html/app'
+
+      - name: Deploy artifact to EC2
+        run: |
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r \
+            ./dist_downloaded/* \
+            ${{ env.EC2_USER }}@${{ env.EC2_HOST }}:/var/www/html/app/
+
+      - name: Reload Nginx on EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ${{ env.EC2_USER }}@${{ env.EC2_HOST }} \
+            'sudo systemctl reload nginx'
+
+      - name: Verify Deployment (Smoke Test)
+        run: |
+          sleep 10 # Gib Nginx etwas Zeit
+          curl -Isf http://${{ env.EC2_HOST }}/health.html # Prüft den Health-Endpunkt
+          curl -Isf http://${{ env.EC2_HOST }}/ # Prüft die Hauptseite
