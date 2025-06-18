@@ -7,12 +7,11 @@ on:
   workflow_dispatch: # Ermöglicht manuelles Auslösen
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }} # Wird global für Jobs gesetzt
+  AWS_REGION: ${{ secrets.AWS_REGION }}
   TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
   TF_STATE_DYNAMODB_TABLE: ${{ secrets.TF_STATE_DYNAMODB_TABLE }}
-  # Terraform benötigt diese ENV Vars für das S3 Backend, wenn sie nicht in der backend-config Datei stehen
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }} # Für Terraform init Backend-Konfig benötigt
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # Für Terraform init Backend-Konfig benötigt
   # AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }} # Falls du temporäre Credentials/Rollen nutzt
 
 jobs:
@@ -30,7 +29,7 @@ jobs:
         with:
           node-version: '18' # Oder deine bevorzugte LTS Version
           cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: frontend/package-lock.json # Pfad zur Lock-Datei anpassen, falls nötig
 
       - name: Install dependencies
         working-directory: ./frontend
@@ -48,21 +47,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact_info.outputs.artifact_name }}
-          path: frontend/dist/
+          path: frontend/dist/ # Stelle sicher, dass dies der korrekte Build-Output-Ordner ist
           retention-days: 7
 
   infra_provision:
     name: Provision AWS Infrastructure with Terraform
     runs-on: ubuntu-latest
     needs: ci_build # Läuft erst nach erfolgreichem Build
-    outputs:
+    outputs: # Definiere die Outputs dieses Jobs hier
       ec2_public_ip: ${{ steps.tf_outputs.outputs.instance_public_ip }}
-      ec2_user: ${{ steps.tf_vars.outputs.ec2_user_var }}
+      ec2_user_name: ${{ steps.ec2_user_for_ssh.outputs.user_name }}
     env: # Umgebungsvariablen spezifisch für diesen Job
-      # AWS Credentials werden von der Action aws-actions/configure-aws-credentials gesetzt
       TF_VAR_ssh_public_key_content: ${{ secrets.SSH_PUBLIC_KEY }} # Übergibt den Inhalt des Public Keys an Terraform
       TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
-      # Weitere TF_VARs hier, falls benötigt
+      TF_VAR_ec2_user: ${{ secrets.EC2_USER }} # Übergibt den EC2_USER direkt als Terraform-Variable
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -99,37 +97,33 @@ jobs:
       - name: Terraform Plan
         id: plan
         working-directory: ./terraform
-        run: terraform plan -no-color -input=false -var="ec2_user=${{ secrets.EC2_USER }}" # Übergabe der EC2_USER Variable
-        continue-on-error: false # Pipeline soll bei Plan-Fehlern stoppen (optional)
+        run: terraform plan -no-color -input=false # TF_VAR_ec2_user wird schon als ENV Var gesetzt
+        continue-on-error: false
 
       - name: Terraform Apply
         id: apply
         working-directory: ./terraform
-        run: terraform apply -auto-approve -input=false -var="ec2_user=${{ secrets.EC2_USER }}"
+        run: terraform apply -auto-approve -input=false # TF_VAR_ec2_user wird schon als ENV Var gesetzt
 
-      - name: Get Terraform Outputs
+      - name: Get Terraform Output for EC2 Public IP
         id: tf_outputs
         working-directory: ./terraform
         run: |
           echo "instance_public_ip=$(terraform output -raw instance_public_ip)" >> $GITHUB_OUTPUT
-      
-      - name: Set EC2 User Variable from Secret
-        id: tf_vars
-        run: echo "ec2_user_var=${{ secrets.EC2_USER }}" >> $GITHUB_OUTPUT
 
+      - name: Set EC2 User for SSH output
+        id: ec2_user_for_ssh
+        run: echo "user_name=${{ secrets.EC2_USER }}" >> $GITHUB_OUTPUT # Nimmt den Wert aus dem Secret
 
   app_deploy:
     name: Deploy App to EC2
     runs-on: ubuntu-latest
-    needs: infra_provision # Läuft erst nach erfolgreicher Infrastruktur-Provisionierung
+    needs: infra_provision # Hängt vom infra_provision Job ab
     env:
       EC2_HOST: ${{ needs.infra_provision.outputs.ec2_public_ip }}
-      EC2_USER: ${{ needs.infra_provision.outputs.ec2_user }} # Verwende den Output vom infra_provision Job
+      EC2_USER: ${{ needs.infra_provision.outputs.ec2_user_name }}
       ARTIFACT_NAME: ${{ needs.ci_build.outputs.artifact_name }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4 # Nicht unbedingt nötig, wenn nur Artefakt gebraucht wird
-
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
@@ -141,26 +135,35 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
+      - name: Debug Connection Info Before SSH
+        run: |
+          echo "Attempting to connect to host: ${{ env.EC2_HOST }}"
+          echo "Using user: ${{ env.EC2_USER }}"
+          if [ -z "${{ env.EC2_HOST }}" ]; then echo "EC2_HOST is empty!"; exit 1; fi
+          if [ -z "${{ env.EC2_USER }}" ]; then echo "EC2_USER is empty!"; exit 1; fi
+
       - name: Create target directory on EC2 and set permissions
         run: |
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ${{ env.EC2_USER }}@${{ env.EC2_HOST }} \
+          ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
             'sudo mkdir -p /var/www/html/app && sudo chown -R ${{ env.EC2_USER }}:${{ env.EC2_USER }} /var/www/html/app'
 
       - name: Deploy artifact to EC2
         run: |
-          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r \
+          scp -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r \
             ./dist_downloaded/* \
-            ${{ env.EC2_USER }}@${{ env.EC2_HOST }}:/var/www/html/app/
+            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}:/var/www/html/app/" # Sicherstellen, dass der Zielpfad mit / endet für Verzeichnisse
 
       - name: Reload Nginx on EC2
         run: |
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ${{ env.EC2_USER }}@${{ env.EC2_HOST }} \
+          ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
             'sudo systemctl reload nginx'
 
       - name: Verify Deployment (Smoke Test)
         run: |
           sleep 10 # Gib Nginx etwas Zeit
-          curl -Isf http://${{ env.EC2_HOST }}/health.html # Prüft den Health-Endpunkt
-          curl -Isf http://${{ env.EC2_HOST }}/ # Prüft die Hauptseite
+          echo "Verifying health endpoint: http://${{ env.EC2_HOST }}/health.html"
+          curl -Isf http://${{ env.EC2_HOST }}/health.html
+          echo "Verifying main page: http://${{ env.EC2_HOST }}/"
+          curl -Isf http://${{ env.EC2_HOST }}/
