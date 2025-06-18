@@ -94,7 +94,7 @@ resource "aws_instance" "web" {
   associate_public_ip_address = true # Sicherstellen, dass sie eine öffentliche IP bekommt
 
   user_data = <<-EOF
-            #!/binbash
+            #!/bin/bash
             sudo apt-get update -y
             sudo apt-get install -y nginx
             sudo systemctl start nginx
